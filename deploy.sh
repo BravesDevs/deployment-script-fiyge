@@ -3,7 +3,7 @@
 set -e
 
 # Global variables for easy control
-ORIGINAL_REPO="BravesDevs/submodules"
+ORIGINAL_REPO="fiyge/bundle-development"
 URL_PROTOCOL="https"  # Change to "ssh" if preferred for submodule URLs
 
 if [ -z "$ORIGINAL_REPO" ]; then
