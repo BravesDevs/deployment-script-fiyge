@@ -113,5 +113,14 @@ fi
 echo "Pushing updates to the forked vertical repository..."
 git push origin "$current_branch"
 
+echo "Cleaning up local submodule copies to save space..."
+for path in $submodules; do
+  if [ -d "$path" ]; then
+    git submodule deinit -f -- "$path" || true
+    rm -rf "$path"
+    rm -rf ".git/modules/$path"
+  fi
+done
+
 echo "Process complete. Forked vertical repository: https://github.com/${forked_main}"
 echo "Remember to run 'git submodule update --init --recursive' in the cloned repo if needed."
