@@ -7,15 +7,16 @@ ORIGINAL_REPO="fiyge/bundle-development"
 URL_PROTOCOL="https"  # Change to "ssh" if preferred for submodule URLs
 DEFAULT_BRANCH="main"  # Assuming the default branch is 'main'; adjust if necessary
 
-# Design Pattern: Modular functions for better structure and reusability
-
 # Function to handle GitHub authentication
 function authenticate() {
   echo "Do you want to authenticate with a different GitHub account? This will log out the current session and open a browser for SSO login. (y/n)"
   read -r response
   if [[ $response =~ ^[yY]$ ]]; then
     gh auth logout
-    gh auth login --web
+    gh auth login --web || {
+      echo "Authentication failed. Please ensure 'gh' is installed and try again."
+      exit 1
+    }
   fi
 
   your_username=$(gh api user --jq '.login')
@@ -68,7 +69,14 @@ function fork_main_repo() {
   forked_name="${vertical_name}-fork-${random_suffix}"
 
   echo "Forking the main repository..."
-  gh repo fork "$repo" --clone=false
+  gh repo fork "$repo" --clone=false || {
+    echo "Error: Forking failed. A conflicting operation may be in progress. Waiting 10 seconds and retrying..."
+    sleep 10
+    gh repo fork "$repo" --clone=false || {
+      echo "Error: Forking failed again. Check for existing forks or GitHub API issues."
+      exit 1
+    }
+  }
 
   temporary_forked="${username}/${vertical_name}"
 
@@ -80,9 +88,17 @@ function fork_main_repo() {
 
   forked_main="${username}/${forked_name}"
 
-  echo "Cloning the forked repository..."
-  git clone "https://github.com/${forked_main}.git" "$forked_name"
-  cd "$forked_name"
+  # Check for existing directory and append suffix if needed
+  clone_dir="$forked_name"
+  counter=1
+  while [ -d "$clone_dir" ]; do
+    clone_dir="${forked_name}-${counter}"
+    ((counter++))
+  done
+
+  echo "Cloning the forked repository to $clone_dir..."
+  git clone "https://github.com/${forked_main}.git" "$clone_dir"
+  cd "$clone_dir"
 
   echo "${forked_main}"
 }
@@ -92,11 +108,13 @@ function process_submodules() {
   local url_protocol=$1
 
   current_branch=$(git branch --show-current)
-  submodules=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}' || true)
+  submodules=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | grep '^client/module/' | awk '{print $2}' || true)
   changes_made=false
 
   if [ -z "$submodules" ]; then
-    echo "No submodules found. Nothing to fork or relink."
+    echo "No submodules found in /client/module. Verify .gitmodules file or submodule paths."
+    echo "Current .gitmodules content:"
+    cat .gitmodules 2>/dev/null || echo "No .gitmodules file found."
     return
   fi
 
@@ -122,7 +140,10 @@ function process_submodules() {
     # Check if the submodule repo is accessible
     if gh repo view "$sub_original" >/dev/null 2>&1; then
       echo "Forking accessible submodule $sub_original..."
-      gh repo fork "$sub_original" --clone=false
+      gh repo fork "$sub_original" --clone=false || {
+        echo "Warning: Failed to fork submodule $sub_original. Skipping."
+        continue
+      }
 
       forked_sub="${your_username}/${sub_repo_name}"
 
@@ -148,7 +169,7 @@ function process_submodules() {
 
   if $changes_made; then
     echo "Committing changes to relink submodules..."
-    git commit -m "Relinked accessible submodules to forked versions" || echo "No changes to commit."
+    git commit -m "Relinked accessible submodules to forked versions in /client/module" || echo "No changes to commit."
     echo "Pushing updates to the forked repository..."
     git push origin "$current_branch"
   else
@@ -158,8 +179,8 @@ function process_submodules() {
 
 # Function to clean up local submodules
 function cleanup_submodules() {
-  submodules=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}' || true)
-  echo "Cleaning up local submodule copies to save space..."
+  submodules=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | grep '^client/module/' | awk '{print $2}' || true)
+  echo "Cleaning up local submodule copies in /client/module to save space..."
   for path in $submodules; do
     if [ -d "$path" ]; then
       git submodule deinit -f -- "$path" || true
