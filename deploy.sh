@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 # Constants
@@ -18,7 +17,6 @@ function authenticate() {
       exit 1
     }
   fi
-
   your_username=$(gh api user --jq '.login')
   if [ -z "$your_username" ]; then
     echo "Error: Could not determine GitHub username. Ensure gh is authenticated."
@@ -31,7 +29,6 @@ function authenticate() {
 function check_write_access() {
   local repo=$1
   local username=$2
-
   permission=$(gh api "repos/${repo}/collaborators/${username}/permission" --jq '.permission' 2>/dev/null || echo "none")
   if [[ "$permission" == "write" || "$permission" == "admin" ]]; then
     return 0  # Has access
@@ -51,7 +48,6 @@ function create_branch() {
 
   # Create the new branch
   gh api "repos/${repo}/git/refs" -X POST -f "ref=refs/heads/${branch_name}" -f "sha=${default_sha}" >/dev/null 2>&1
-
   if [ $? -eq 0 ]; then
     echo "Branch '${branch_name}' created successfully in ${repo}."
   else
@@ -63,12 +59,11 @@ function create_branch() {
 function fork_main_repo() {
   local repo=$1
   local username=$2
-
   vertical_name="${repo#*/}"
   random_suffix=$(head -c 8 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)
   forked_name="${vertical_name}-fork-${random_suffix}"
 
-  echo "Forking the main repository..."
+  echo "Forking the main repository ($repo)..."
   gh repo fork "$repo" --clone=false || {
     echo "Error: Forking failed. A conflicting operation may be in progress. Waiting 10 seconds and retrying..."
     sleep 10
@@ -79,13 +74,11 @@ function fork_main_repo() {
   }
 
   temporary_forked="${username}/${vertical_name}"
-
   echo "Renaming the forked repository to: $forked_name"
   gh repo rename "$forked_name" --repo "$temporary_forked" --yes || {
     echo "Warning: Rename failed (possibly name conflict). Continuing with original forked name."
     forked_name="$vertical_name"
   }
-
   forked_main="${username}/${forked_name}"
 
   # Check for existing directory and append suffix if needed
@@ -96,32 +89,44 @@ function fork_main_repo() {
     ((counter++))
   done
 
-  echo "Cloning the forked repository to $clone_dir..."
+  echo "Cloning the forked repository to directory: $clone_dir..."
   git clone "https://github.com/${forked_main}.git" "$clone_dir"
   cd "$clone_dir"
-
   echo "${forked_main}"
 }
 
 # Function to process and relink submodules
 function process_submodules() {
   local url_protocol=$1
+  local username=$2
 
-  current_branch=$(git branch --show-current)
-  submodules=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | grep '^client/module/' | awk '{print $2}' || true)
-  changes_made=false
-
-  if [ -z "$submodules" ]; then
-    echo "No submodules found in /client/module. Verify .gitmodules file or submodule paths."
-    echo "Current .gitmodules content:"
-    cat .gitmodules 2>/dev/null || echo "No .gitmodules file found."
+  if [ ! -f .gitmodules ]; then
+    echo "No .gitmodules file found. No submodules to process."
     return
   fi
 
-  for path in $submodules; do
-    echo "Processing submodule at path: $path"
+  current_branch=$(git branch --show-current)
+  echo "Scanning .gitmodules for submodules to fork and relink..."
 
-    url=$(git config --file .gitmodules --get "submodule.${path}.url")
+  # Use process substitution (< <(...)) to avoid creating a subshell that would prevent variable updates.
+  while read -r key path_val; do
+    # $key is 'submodule.NAME.path'
+    # $path_val is the actual path, e.g., 'client/module/sub1'
+
+    # Filter for submodules in the specified directory
+    if [[ "$path_val" != client/module/* ]]; then
+      continue
+    fi
+
+    echo "-----------------------------------------------------"
+    echo "Processing submodule at path: $path_val"
+
+    # Extract the submodule's logical name from the key for robust URL lookup
+    name=$(echo "$key" | sed -E 's/^submodule\.(.*)\.path$/\1/')
+    
+    # Get the URL using the correct logical name
+    url=$(git config --file .gitmodules --get "submodule.${name}.url")
+    echo "Original URL: $url"
 
     # Parse the original submodule repo (owner/repo) from URL
     if [[ $url == git@* ]]; then
@@ -131,63 +136,62 @@ function process_submodules() {
       tmp="${url#https://github.com/}"
       sub_original="${tmp%.git}"
     else
-      echo "Unsupported submodule URL format: $url"
+      echo "Warning: Unsupported submodule URL format: $url. Skipping."
       continue
     fi
-
     sub_repo_name="${sub_original#*/}"
-
-    # Check if the submodule repo is accessible
-    if gh repo view "$sub_original" >/dev/null 2>&1; then
-      echo "Forking accessible submodule $sub_original..."
-      gh repo fork "$sub_original" --clone=false || {
-        echo "Warning: Failed to fork submodule $sub_original. Skipping."
-        continue
-      }
-
-      forked_sub="${your_username}/${sub_repo_name}"
-
-      if [ "$url_protocol" = "ssh" ]; then
-        new_url="git@github.com:${forked_sub}.git"
-      else
-        new_url="https://github.com/${forked_sub}.git"
-      fi
-
-      echo "Delinking the original submodule..."
-      git submodule deinit -f -- "$path"
-      rm -rf ".git/modules/$path"
-      git rm -f "$path"
-
-      echo "Linking the forked submodule..."
-      git submodule add "$new_url" "$path"
-
-      changes_made=true
-    else
-      echo "Submodule $sub_original is inaccessible (private or no access). Skipping forking and keeping original link."
+    echo "Original repository: $sub_original"
+    
+    # Fork the submodule repo
+    echo "Attempting to fork $sub_original..."
+    if ! gh repo fork "$sub_original" --clone=false; then
+      echo "Warning: Failed to fork submodule $sub_original. It might already be forked or you lack permissions. Skipping."
+      continue
     fi
-  done
+    echo "Successfully forked $sub_original to your account ($username)."
 
-  if $changes_made; then
-    echo "Committing changes to relink submodules..."
-    git commit -m "Relinked accessible submodules to forked versions in /client/module" || echo "No changes to commit."
-    echo "Pushing updates to the forked repository..."
+    forked_sub="${username}/${sub_repo_name}"
+    
+    # Construct the new URL based on the specified protocol
+    if [ "$url_protocol" = "ssh" ]; then
+      new_url="git@github.com:${forked_sub}.git"
+    else
+      new_url="https://github.com/${forked_sub}.git"
+    fi
+    echo "New URL will be: $new_url"
+
+    # Update the submodule URL directly in .gitmodules
+    git config -f .gitmodules "submodule.${name}.url" "$new_url"
+    echo "Updated .gitmodules for '$name'."
+
+  done < <(git config --file .gitmodules --get-regexp '^submodule\..*\.path$')
+
+  # After the loop, check if .gitmodules was modified and commit/push the changes.
+  if ! git diff --quiet --exit-code .gitmodules; then
+    echo "-----------------------------------------------------"
+    echo "Committing URL changes in .gitmodules..."
+    git add .gitmodules
+    git commit -m "chore(submodules): Relink submodules in client/module to forked versions"
+    
+    echo "Pushing updates to the forked repository on branch '$current_branch'..."
     git push origin "$current_branch"
   else
-    echo "No submodules were relinked."
+    echo "-----------------------------------------------------"
+    echo "No submodules were relinked. No changes to commit."
   fi
 }
 
-# Function to clean up local submodules
+
+# Function to clean up local submodules for a fresh state
 function cleanup_submodules() {
-  submodules=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | grep '^client/module/' | awk '{print $2}' || true)
-  echo "Cleaning up local submodule copies in /client/module to save space..."
-  for path in $submodules; do
-    if [ -d "$path" ]; then
-      git submodule deinit -f -- "$path" || true
-      rm -rf "$path"
-      rm -rf ".git/modules/$path"
-    fi
-  done
+  echo "-----------------------------------------------------"
+  echo "The remote repository has been updated with the new submodule links."
+  echo "Cleaning up local submodule workspace to provide a fresh clone state..."
+  
+  # This command deinitializes all submodules, removing their entries from .git/config
+  # and clearing the local submodule directories.
+  git submodule deinit --all --force > /dev/null
+  echo "Local submodule configurations have been removed."
 }
 
 # Main logic
@@ -200,7 +204,7 @@ echo "Choose deployment path: (1) Branching or (2) Forking"
 read -r choice
 
 authenticate
-your_username=$(gh api user --jq '.login')  # Already set in authenticate, but ensure
+your_username=$(gh api user --jq '.login')
 
 case "$choice" in
   1)
@@ -214,10 +218,14 @@ case "$choice" in
   2)
     echo "Selected Forking path."
     forked_main=$(fork_main_repo "$ORIGINAL_REPO" "$your_username")
-    process_submodules "$URL_PROTOCOL"
+    process_submodules "$URL_PROTOCOL" "$your_username"
     cleanup_submodules
-    echo "Process complete. Forked repository: https://github.com/${forked_main}"
-    echo "Remember to run 'git submodule update --init --recursive' in the cloned repo if needed."
+    echo "====================================================="
+    echo "✅ Process complete!"
+    echo "Forked repository URL: https://github.com/${forked_main}"
+    echo "To work with the submodules locally, navigate to the repo directory and run:"
+    echo "git submodule update --init --recursive"
+    echo "====================================================="
     ;;
   *)
     echo "Invalid choice. Exiting."
